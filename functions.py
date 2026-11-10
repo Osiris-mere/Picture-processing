@@ -163,6 +163,93 @@ def _composite_frame(background, foreground, destination_points, mode):
     return result
 
 
+def _feature_points(gray, quad):
+    """提取屏幕四边形内部特征，供单应性估计使用。"""
+    height, width = gray.shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    polygon = np.rint(quad).astype(np.int32)
+    cv2.fillConvexPoly(mask, polygon, 255)
+    # 略微收缩掩膜，尽量避免跟踪到屏幕外背景。
+    mask = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8))
+    points = cv2.goodFeaturesToTrack(
+        gray, maxCorners=120, qualityLevel=0.01, minDistance=5,
+        blockSize=7, mask=mask, useHarrisDetector=False)
+    if points is None:
+        return np.empty((0, 1, 2), dtype=np.float32)
+    return points.astype(np.float32)
+
+
+def _forward_backward_track(previous_gray, gray, points):
+    """使用正反向 LK 和更大的金字塔搜索窗口筛除不可靠跟踪点。"""
+    if points is None or len(points) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+    params = dict(winSize=(31, 31), maxLevel=4, criteria=criteria,
+                  minEigThreshold=1e-5)
+    forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+        previous_gray, gray, points, None, **params)
+    if forward is None or forward_status is None:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+        gray, previous_gray, forward, None, **params)
+    if backward is None or backward_status is None:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    old = points.reshape(-1, 2)
+    new = forward.reshape(-1, 2)
+    round_trip_error = np.linalg.norm(backward.reshape(-1, 2) - old, axis=1)
+    valid = (forward_status.reshape(-1) == 1) & (backward_status.reshape(-1) == 1)
+    valid &= np.isfinite(new).all(axis=1) & (round_trip_error < 2.5)
+    return old[valid], new[valid]
+
+
+def _valid_tracked_quad(quad, width, height):
+    """检查跟踪结果仍是可用于透视变换的凸四边形。"""
+    if quad is None or not np.isfinite(quad).all():
+        return False
+    contour = np.rint(quad).astype(np.int32).reshape(-1, 1, 2)
+    if not cv2.isContourConvex(contour) or abs(cv2.contourArea(contour)) < 16:
+        return False
+    # 允许屏幕部分离开画面，但拒绝明显失控的坐标。
+    margin_x, margin_y = width * 0.25, height * 0.25
+    return (np.all(quad[:, 0] >= -margin_x) and
+            np.all(quad[:, 0] <= width - 1 + margin_x) and
+            np.all(quad[:, 1] >= -margin_y) and
+            np.all(quad[:, 1] <= height - 1 + margin_y))
+
+
+def _track_screen_quad(previous_gray, gray, quad, features):
+    """先用屏幕纹理估计单应性；纹理不足时退回四角的正反向 LK。"""
+    # 将角点作为额外跟踪点，低纹理屏幕也有机会用角点直接跟踪。
+    track_points = np.concatenate((features.reshape(-1, 1, 2),
+                                   quad.reshape(-1, 1, 2)), axis=0)
+    old_points, new_points = _forward_backward_track(previous_gray, gray, track_points)
+    feature_count = len(features)
+    tracked_quad = None
+
+    if len(old_points) >= 4:
+        matrix, inliers = cv2.findHomography(old_points, new_points,
+                                             cv2.RANSAC, 4.0)
+        if matrix is not None and inliers is not None:
+            inlier_mask = inliers.reshape(-1).astype(bool)
+            # 至少需要四个一致的对应点；对四角 LK 点则仍可估计屏幕整体运动。
+            if np.count_nonzero(inlier_mask) >= 4:
+                tracked_quad = cv2.perspectiveTransform(
+                    quad.reshape(1, 4, 2), matrix).reshape(4, 2)
+
+    if not _valid_tracked_quad(tracked_quad, gray.shape[1], gray.shape[0]):
+        # 特征点不足或单应性不稳定时，尝试直接追踪四角。
+        corner_old, corner_new = _forward_backward_track(
+            previous_gray, gray, quad.reshape(-1, 1, 2))
+        if len(corner_old) == 4:
+            tracked_quad = corner_new.reshape(4, 2)
+        else:
+            tracked_quad = None
+
+    if not _valid_tracked_quad(tracked_quad, gray.shape[1], gray.shape[0]):
+        return None
+    return tracked_quad.astype(np.float32)
+
+
 def function_hw3(bg_image, fg_image, points_text, mode):
     if bg_image is None:
         raise gr.Error('请先上传底图。', duration=5)
@@ -174,7 +261,7 @@ def function_hw3(bg_image, fg_image, points_text, mode):
 
 
 def function_hw3_video(video_file, fg_image, points_text, mode):
-    """在视频首帧给定四角，并用稀疏光流逐帧跟踪四角后替换屏幕内容。"""
+    """以正反向光流、屏幕特征单应性和四角回退追踪屏幕，并替换视频内容。"""
     if video_file is None:
         raise gr.Error('请先上传底图视频。')
     if fg_image is None:
@@ -188,7 +275,7 @@ def function_hw3_video(video_file, fg_image, points_text, mode):
         capture.release()
         raise gr.Error('视频没有可读取的首帧。')
     height, width = first_frame.shape[:2]
-    points = _parse_quad(points_text, width, height).reshape(4, 1, 2)
+    points = _parse_quad(points_text, width, height)
     fps = capture.get(cv2.CAP_PROP_FPS)
     if not np.isfinite(fps) or fps <= 0:
         fps = 25.0
@@ -198,29 +285,38 @@ def function_hw3_video(video_file, fg_image, points_text, mode):
                              (width, height))
     if not writer.isOpened():
         capture.release()
+        os.remove(output_path)
         raise gr.Error('無法建立輸出影片，請確認 OpenCV 的 mp4v 編碼器可用。')
+
     previous_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-    current_points = points.astype(np.float32)
+    current_quad = points.astype(np.float32)
+    features = _feature_points(previous_gray, current_quad)
+    frame_index = 1
     try:
         frame = _composite_frame(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
-                                 fg_image, current_points.reshape(4, 2), mode)
+                                 fg_image, current_quad, mode)
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         while True:
             ok, frame_bgr = capture.read()
             if not ok:
                 break
+            frame_index += 1
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-                previous_gray, gray, current_points, None,
-                winSize=(21, 21), maxLevel=3,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-            if next_points is None or not np.all(status.reshape(-1)):
-                raise gr.Error('四角追踪失败；请尝试更清晰、运动更平滑的视频。')
-            current_points = next_points
+            next_quad = _track_screen_quad(previous_gray, gray, current_quad, features)
+            if next_quad is None:
+                raise gr.Error(
+                    f'第 {frame_index} 帧四角追踪失败；请检查画面是否被遮挡或屏幕已离开画面。')
             output = _composite_frame(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB),
-                                      fg_image, current_points.reshape(4, 2), mode)
+                                      fg_image, next_quad, mode)
             writer.write(cv2.cvtColor(output, cv2.COLOR_RGB2BGR))
+            current_quad = next_quad
             previous_gray = gray
+            # 每帧重检屏幕纹理，避免旧特征丢失后无法恢复。
+            features = _feature_points(previous_gray, current_quad)
+    except Exception:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        raise
     finally:
         capture.release()
         writer.release()
