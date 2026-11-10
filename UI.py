@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import cv2
 import gradio as gr
 
 
@@ -73,9 +74,10 @@ def create_demo_hw3(process, process_video=None):
                 output_image = gr.Image(type='numpy', label='处理结果', interactive=False)
         run_btn.click(fn=process, inputs=[bg_img, fg_img, points, mode], outputs=[output_image])
 
-        def add_corner(image, selected_points, evt: gr.SelectData):
+        def add_corner(image, selected_points, evt: gr.SelectData, target='底图'):
+            selected_points = selected_points or []
             if image is None:
-                return selected_points, '', '请先上传底图。'
+                return selected_points, '', '请先上传' + target + '。'
             if len(selected_points) >= 4:
                 return selected_points, '; '.join(
                     f'{x},{y}' for x, y in selected_points), '四个角已选好；如需修改，请点击“清除并重选四角”。'
@@ -84,19 +86,24 @@ def create_demo_hw3(process, process_video=None):
                 x, y = int(round(x)), int(round(y))
             except (TypeError, ValueError):
                 return selected_points, '; '.join(
-                    f'{x},{y}' for x, y in selected_points), '无法读取点击位置，请在底图上点击。'
+                    f'{x},{y}' for x, y in selected_points), '无法读取点击位置，请在预览图上点击。'
             height, width = image.shape[:2]
             if not (0 <= x < width and 0 <= y < height):
                 return selected_points, '; '.join(
-                    f'{px},{py}' for px, py in selected_points), '点击位置超出底图范围，请重新点击。'
+                    f'{px},{py}' for px, py in selected_points), '点击位置超出图像范围，请重新点击。'
             selected_points = list(selected_points) + [[x, y]]
             point_names = ['左上', '右上', '右下', '左下']
             coordinates = '; '.join(f'{px},{py}' for px, py in selected_points)
             if len(selected_points) == 4:
-                status = '四个角已选好，可以运行区域替换；顺序为左上、右上、右下、左下。'
+                status = ('视频首帧四角已选好，可以点击“追踪屏幕并生成视频”；顺序为左上、右上、右下、左下。'
+                          if target == '视频首帧' else
+                          '四个角已选好，可以运行区域替换；顺序为左上、右上、右下、左下。')
             else:
                 status = f'已选{point_names[len(selected_points) - 1]}角；请继续点击{point_names[len(selected_points)]}角。'
             return selected_points, coordinates, status
+
+        def add_video_corner(image, selected_points, evt: gr.SelectData):
+            return add_corner(image, selected_points, evt, '视频首帧')
 
         def reset_corners():
             return [], '', '已清除，请依次点击：左上 → 右上 → 右下 → 左下。'
@@ -112,12 +119,44 @@ def create_demo_hw3(process, process_video=None):
                            outputs=[point_state, points, point_status])
 
         if process_video is not None:
-            gr.Markdown('### 视频扩展：四角光流追踪\n上传含屏幕的底图视频；将底图视频首帧的屏幕四角按上述顺序点击选取。')
+            gr.Markdown('### 视频扩展：四角光流追踪\n上传含屏幕的底图视频后，系统会显示首帧预览；请在该预览图上依次点击屏幕左上、右上、右下、左下四角。视频四角坐标与上方静态底图的坐标相互独立。')
             with gr.Row():
                 input_video = gr.Video(label='底图视频')
+                video_frame = gr.Image(type='numpy', label='底图视频首帧（点击四角选取）', interactive=True)
+            video_point_state = gr.State([])
+            video_point_status = gr.Markdown('上传底图视频后，首帧将显示在这里。')
+            with gr.Row():
+                video_points = gr.Textbox(label='首帧已选四角坐标 (x,y)', interactive=False,
+                                          placeholder='点击上方首帧预览选取四个角后自动填入', lines=2)
+                clear_video_points = gr.Button('清除并重选四角')
+            with gr.Row():
                 output_video = gr.Video(label='替换后的视频', interactive=False)
             video_btn = gr.Button('追踪屏幕并生成视频')
-            video_btn.click(fn=process_video, inputs=[input_video, fg_img, points, mode], outputs=[output_video])
+
+            def load_video_first_frame(video_file):
+                if video_file is None:
+                    return None, [], '', '请先上传底图视频。'
+                video_path = video_file.get('name') or video_file.get('path') if isinstance(video_file, dict) else video_file
+                capture = cv2.VideoCapture(video_path)
+                try:
+                    if not capture.isOpened():
+                        raise gr.Error('无法读取所选视频文件。')
+                    ok, first_frame = capture.read()
+                    if not ok:
+                        raise gr.Error('视频没有可读取的首帧。')
+                    frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+                    return frame_rgb, [], '', '请在首帧预览上依次点击：左上 → 右上 → 右下 → 左下。'
+                finally:
+                    capture.release()
+
+            input_video.change(fn=load_video_first_frame, inputs=[input_video],
+                               outputs=[video_frame, video_point_state, video_points, video_point_status])
+            video_frame.select(fn=add_video_corner, inputs=[video_frame, video_point_state],
+                               outputs=[video_point_state, video_points, video_point_status])
+            clear_video_points.click(fn=reset_corners, inputs=[],
+                                     outputs=[video_point_state, video_points, video_point_status])
+            video_btn.click(fn=process_video,
+                            inputs=[input_video, fg_img, video_points, mode], outputs=[output_video])
     return demo
 
 
